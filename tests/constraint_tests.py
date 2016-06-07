@@ -7,23 +7,16 @@ from nose.tools import eq_, assert_raises
 import numpy as np
 import pandas as pd
 
-from oemof.core import energy_system as es
-from oemof.core.network.entities import Bus
-from oemof.core.network.entities.buses import HeatBus
-from oemof.core.network.entities.components import (sources as source,
-                                                    transformers as transformer,
-                                                    sinks as sink)
-from oemof.solph import optimization_model as om, predefined_objectives
+from oemof.solph.network import Investment
+from oemof.solph import OperationalModel
+
+from oemof.core import energy_system as core_es
+import oemof.solph as solph
+
+from oemof.solph import (Bus, Source, Sink, Flow, LinearTransformer, Storage)
 from oemof.tools import create_components as cc, helpers
 
 logging.disable(logging.INFO)
-
-
-class Entity_Tests:
-
-    def test_heatbus(self):
-        "Creating a HeatBus without the temperature attribute raises an error."
-        assert_raises(TypeError, HeatBus, uid="Test")
 
 
 class Constraint_Tests:
@@ -34,43 +27,21 @@ class Constraint_Tests:
         self.objective_pattern = re.compile("^objective.*(?=s\.t\.)",
                                             re.DOTALL|re.MULTILINE)
 
-        self.time_index = pd.date_range('1/1/2012', periods=3, freq='H')
-
-        self.sim = es.Simulation(
-            timesteps=range(len(self.time_index)), solver='glpk',
-            objective_options={
-                'function': predefined_objectives.minimize_cost})
+        self.date_time_index = pd.date_range('1/1/2012', periods=3, freq='H')
 
         self.tmppath = helpers.extend_basic_path('tmp')
         logging.info(self.tmppath)
 
     def setup(self):
-        self.energysystem = es.EnergySystem(time_idx=self.time_index,
-                                            simulation=self.sim)
-        backup = {}
-        for klass in [ source.FixedSource, transformer.Simple,
-                       transformer.Storage, transformer.TwoInputsOneOutput]:
-            backup[klass] = {}
-            for option in klass.optimization_options:
-                backup[klass][option] = klass.optimization_options[option]
-        self.optimization_options_backup = backup
-
-    def teardown(self):
-        backup = self.optimization_options_backup
-        for klass in backup:
-            # Need to copy keys to a new list. Otherwise we would change what
-            # we are iterating over, while iterating over it, making python
-            # unhappy.
-            for option in list(klass.optimization_options.keys()):
-                if not option in backup[klass]:
-                    del klass.optimization_options[option]
-            for option in backup[klass]:
-                klass.optimization_options[option] = backup[klass][option]
+        self.energysystem = core_es.EnergySystem(groupings=solph.GROUPINGS,
+                                                 time_idx=self.date_time_index)
 
     def compare_lp_files(self, energysystem, filename, ignored=None):
-        opt_model = om.OptimizationModel(energysystem=energysystem)
+        om = OperationalModel(energysystem,
+                              timeindex=self.energysystem.time_idx)
         tmp_filename = filename.replace('.lp', '') + '_tmp.lp'
-        opt_model.write_lp_file(path=self.tmppath, filename=tmp_filename)
+        new_filename = ospath.join(self.tmppath, tmp_filename)
+        om.write(new_filename, io_options={'symbolic_solver_labels': True})
         logging.info("Comparing with file: {0}".format(filename))
         with open(ospath.join(self.tmppath, tmp_filename)) as generated_file:
             with open(ospath.join(ospath.dirname(ospath.realpath(__file__)),
@@ -100,94 +71,51 @@ class Constraint_Tests:
                                                generated_file.name),
                                            lineterm="")))
 
-    def test_transformer_simple(self):
-        """Test transformer.Simple with and without investment."""
+    def test_linear_transformer(self):
+        """Test LinearTransformer without Investment."""
 
-        bgas = Bus(uid="bgas",
-                   type="gas",
-                   price=70)
+        bgas = Bus(label="gas")
 
-        bel = Bus(uid="bel",
-                  type="el")
+        bel = Bus(label="electricity")
 
-        sink.Simple(uid="excess", inputs=[bel], bound_type='min')
+        LinearTransformer(
+            label="powerplant_gas",
+            inputs={bgas: Flow()},
+            outputs={bel: Flow(nominal_value=10e10, variable_costs=50)},
+            conversion_factors={bel: 0.58})
 
-        transformer.Simple(
-            uid='pp_gas',
-            inputs=[bgas],
-            outputs=[bel],
-            opex_var=50,
-            out_max=[10e10],
-            eta=[0.58])
-
-        self.compare_lp_files(self.energysystem, "transformer_simp.lp",
+        self.compare_lp_files(self.energysystem, "transformer_linear.lp",
                               ignored=self.objective_pattern)
 
-        transformer.Simple.optimization_options['investment'] = True
-        self.compare_lp_files(self.energysystem, "transformer_simp_invest.lp")
+    # def test_linear_transformer_invest(self):
+    #     """Test LinearTransformer with Investment."""
+    #
+    #     bgas = Bus(label="gas")
+    #
+    #     bel = Bus(label="electricity")
+    #
+    #     LinearTransformer(
+    #         label="powerplant_gas",
+    #         inputs={bgas: Flow()},
+    #         outputs={bel: Flow(variable_costs=50,
+    #                            investment=Investment(ep_costs=80, maximum=4e10))
+    #                  },
+    #         conversion_factors={bel: 0.58})
+    #
+    #     self.compare_lp_files(self.energysystem, "transformer_simp_invest.lp",
+    #                           ignored=self.objective_pattern)
 
     def test_source_fixed(self):
-        """Test source.FixedSource with and without investment."""
+        """Test Source without investment."""
 
         bel = Bus(uid="bel", type="el")
 
-        source.Commodity(uid='shortage', outputs=[bel])
-
-        source.FixedSource(uid="wind",
-                           outputs=[bel],
-                           val=[50, 80, 30],
-                           out_max=[1000000],
-                           add_out_limit=0,
-                           capex=1000,
-                           opex_fix=20,
-                           lifetime=25,
-                           crf=0.08)
+        Source(label='wind', outputs={bel: Flow(actual_value=[50, 80, 30],
+                                                nominal_value=1000000,
+                                                fixed=True, fixed_costs=20)})
 
         self.compare_lp_files(self.energysystem, "source_fixed.lp",
                               ignored=self.objective_pattern)
-        source.FixedSource.optimization_options['investment'] = True
-        self.compare_lp_files(self.energysystem, "source_fixed_invest.lp")
 
     def test_storage(self):
         pass
-
-    def test_two_inputs_one_output(self):
-        TIOO = transformer.TwoInputsOneOutput
-        TIOO.optimization_options['investment'] = True
-
-        btest = HeatBus(
-            uid="bus_test",
-            temperature=1,
-            re_temperature=1)
-
-        district_heat_bus = HeatBus(
-            uid="bus_distr_heat",
-            temperature=np.array([380, 360, 370]),
-            re_temperature=np.array([340, 340, 340]))
-
-        storage_heat_bus = HeatBus(
-            uid="bus_stor_heat",
-            temperature=370)
-
-        postheat = transformer.TwoInputsOneOutput(
-            uid='postheat_elec',
-            inputs=[btest, storage_heat_bus], outputs=[district_heat_bus],
-            opex_var=0, capex=99999,
-            out_max=[999993],
-            in_max=[777, 888],
-            f=cc.instant_flow_heater(storage_heat_bus, district_heat_bus),
-            eta=[0.95, 1])
-
-        assert_raises(ValueError, om.OptimizationModel,
-                      energysystem=self.energysystem)
-
-        postheat.in_max = [None, float('inf')]
-        self.compare_lp_files(self.energysystem,
-                              "two_inputs_one_output_invest.lp")
-
-        TIOO.optimization_options['investment'] = False
-
-        postheat.in_max = [777, 888]
-        self.compare_lp_files(self.energysystem,
-                              "two_inputs_one_output.lp",
-                              ignored=self.objective_pattern)
